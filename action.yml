@@ -1,4 +1,4 @@
-name: Delete Older Releases
+name: Delete Older Releases of Repos
 description: Automatic delete older releases action of any repo
 author: Vucko130
 
