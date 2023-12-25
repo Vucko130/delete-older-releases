@@ -53,12 +53,44 @@ if (shouldDeleteTags) {
   console.log("🔖  corresponding tags also will be deleted");
 }
 
-let deletePattern = process.env.INPUT_DELETE_TAG_PATTERN || "";
-if (deletePattern) {
-  console.log(`releases containing ${deletePattern} will be targeted`);
+const deletePrereleaseOnly = process.env.INPUT_DELETE_PRERELEASE_ONLY === "true";
+
+if (deletePrereleaseOnly) {
+  console.log("🔖  Remove only prerelease");
 }
+
+let deletePatternStr = process.env.INPUT_DELETE_TAG_PATTERN || "";
+let deletePattern = new RegExp("");
+if (deletePatternStr) {
+  console.log(`releases matching ${deletePatternStr} will be targeted`);
+  deletePattern = new RegExp(deletePatternStr);
+}
+
+let keepMinDownloadCount = Number(process.env.INPUT_KEEP_MIN_DOWNLOAD_COUNTS);
+
+if (Number.isNaN(keepMinDownloadCount) || keepMinDownloadCount < 0) {
+  keepMinDownloadCount = 0
+}
+
+if (keepMinDownloadCount === 0) {
+  console.error("🌶  given `keep_min_download_counts` is 0, this will not enable the download count removal rule");
+}else {
+  console.log("🌶  given `keep_min_download_counts` is ",keepMinDownloadCount,", this will continue to add the download count deletion rule to the original deletion rule");
+}
+
+
+let deleteExpiredData = Number(process.env.INPUT_DELETE_EXPIRED_DATA);
+
+if (Number.isNaN(deleteExpiredData) || deleteExpiredData < 0) {
+  deleteExpiredData = 0
+}
+
+console.log("🌶  given `delete_expired_data` is ",deleteExpiredData);
+
+let gitHubRestApi = process.env.INPUT_GITHUB_REST_API_URL || "api.github.com";
+
 const commonOpts = {
-  host: "api.github.com",
+  host: gitHubRestApi,
   port: 443,
   protocol: "https:",
   auth: `user:${GITHUB_TOKEN}`,
@@ -68,19 +100,54 @@ const commonOpts = {
   },
 };
 
-async function deleteOlderReleases(keepLatest) {
+
+async function deleteOlderReleases(keepLatest, keepMinDownloadCount, deleteExpiredData) {
   let releaseIdsAndTags = [];
   try {
-    let data = await fetch({
-      ...commonOpts,
-      path: `/repos/${owner}/${repo}/releases?per_page=100`,
-      method: "GET",
-    });
-    data = data || [];
-    // filter for delete_pattern
-    const activeMatchedReleases = data.filter(
-      ({ draft, tag_name }) => !draft && tag_name.indexOf(deletePattern) !== -1
-    );
+    const releasesData = [];
+    let page = 1;
+    let hasMorePages = true;
+    while (hasMorePages) {
+      let pageData = await fetch({
+        ...commonOpts,
+        path: `/repos/${owner}/${repo}/releases?per_page=100&page=${page}`,
+        method: "GET",
+      });
+      if (pageData.length === 0) {
+        hasMorePages = false;
+      } else {
+        releasesData.push(...pageData);
+        page++;
+      }
+    }
+
+    data = releasesData || [];
+
+    const activeMatchedReleases = data.filter((item) => {
+      if (deletePrereleaseOnly) {
+        if (deletePatternStr) {
+          return !item.draft && item.assets.length > 0 && item.prerelease && item.tag_name.match(deletePattern);
+        } else {
+          return !item.draft && item.assets.length > 0 && item.prerelease;
+        }
+      } else {
+        if (deletePatternStr) {
+          return !item.draft && item.assets.length > 0 && item.tag_name.match(deletePattern);
+        } else {
+          return !item.draft && item.assets.length > 0;
+        }
+      }
+    })
+
+    // const activeMatchedReleases = data.filter((item) => {
+    //   const shouldDelete = deletePrereleaseOnly && deletePatternStr;
+    //   const isDraft = item.draft;
+    //   const hasAssets = item.assets.length > 0;
+    //   const isPrerelease = item.prerelease;
+    //   const isTagMatching = deletePatternStr ? item.tag_name.match(deletePattern) : true;
+    
+    //   return !isDraft && hasAssets && (shouldDelete ? (isTagMatching && isPrerelease) : true);
+    // });
 
     if (activeMatchedReleases.length === 0) {
       console.log(`😕  no active releases found. exiting...`);
@@ -89,16 +156,65 @@ async function deleteOlderReleases(keepLatest) {
 
     const matchingLoggingAddition = deletePattern.length > 0 ? " matching" : "";
 
-    console.log(
-      `💬  found total of ${activeMatchedReleases.length}${matchingLoggingAddition} active release(s)`
-    );
+    if (deletePrereleaseOnly) {
+      console.log(
+        `💬  found total of ${activeMatchedReleases.length}${matchingLoggingAddition} active prerelease(s)`
+      );
+    } else {
+      console.log(
+        `💬  found total of ${activeMatchedReleases.length}${matchingLoggingAddition} active release(s)`
+      );
+    }
+    
+
 
     releaseIdsAndTags = activeMatchedReleases
       .sort((a,b)=> Date.parse(b.published_at) - Date.parse(a.published_at))
-      .map(({ id, tag_name: tagName }) => ({ id, tagName }))
+      .map(item=> {
+        const totalDownloads = item.assets.reduce((sum, asset) => sum + asset.download_count, 0);
+        return {
+            id: item.id,
+            tagName: item.tag_name,
+            published_at: item.published_at,
+            download_counts: totalDownloads
+        }
+      })
       .slice(keepLatest);
 
-  } catch (error) {
+
+    if (keepMinDownloadCount !== 0) 
+    {
+      if (deleteExpiredData !== 0) 
+      {
+        const currentDate = new Date();
+        releaseIdsAndTags = releaseIdsAndTags.filter(item => {
+          const publishedDate = new Date(item.published_at);
+          const timeDifference = currentDate - publishedDate;
+          const daysDifference = Math.floor(timeDifference / (1000 * 3600 * 24)); 
+          return item.download_counts < keepMinDownloadCount || daysDifference > deleteExpiredData;
+        });
+      }
+      else
+      {
+        releaseIdsAndTags=releaseIdsAndTags.filter(item => item.download_counts < keepMinDownloadCount);
+      }
+    }
+    else
+    {
+      if (deleteExpiredData !== 0) 
+      {
+        const currentDate = new Date();
+        releaseIdsAndTags = releaseIdsAndTags.filter(item => {
+          const publishedDate = new Date(item.published_at);
+          const timeDifference = currentDate - publishedDate;
+          const daysDifference = Math.floor(timeDifference / (1000 * 3600 * 24));
+          return daysDifference > deleteExpiredData;
+        });
+      }
+    }
+
+
+   }catch (error) {
     console.error(`🌶  failed to get list of releases <- ${error.message}`);
     console.error(`exiting...`);
     process.exitCode = 1;
@@ -159,7 +275,7 @@ async function deleteOlderReleases(keepLatest) {
 }
 
 async function run() {
-  await deleteOlderReleases(keepLatest);
+  await deleteOlderReleases(keepLatest, keepMinDownloadCount, deleteExpiredData);
 }
 
 run();
